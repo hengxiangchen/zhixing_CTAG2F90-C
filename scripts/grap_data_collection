@@ -1,0 +1,459 @@
+""" Demo to collect imitation learning data using gripper.
+    Author: Hency
+"""
+
+#!/usr/bin/python3
+# -*- coding: UTF-8 -*-
+import minimalmodbus
+import serial
+import time
+import rospy
+from std_msgs.msg import Float32
+import threading
+from geometry_msgs.msg import Wrench
+from message_filters import ApproximateTimeSynchronizer, Subscriber
+from geometry_msgs.msg import WrenchStamped
+
+import moveit_commander
+from geometry_msgs.msg import Pose
+import sys
+from math import radians
+from std_msgs.msg import Int32
+
+import os
+import json
+
+from collections import deque
+from std_srvs.srv import Empty
+from std_msgs.msg import Bool
+from sensor_msgs.msg import JointState
+
+import termios
+import tty
+
+import cv2
+import time
+
+import argparse
+import screeninfo  # pip install screeninfo
+# rosrun move move.py __ns:=my_gen3
+
+# 获取主屏幕尺寸
+screen = screeninfo.get_monitors()[0]
+screen_width, screen_height = screen.width, screen.height
+
+# 寄存器地址
+ENABLE = 0x0100
+POSITION = 0x0102  # 运动位置
+SPEED = 0x0104
+FORCE = 0x0105
+ACCELERATION = 0x0106
+DEACCELERATION = 0x0107
+MOTION_TRIGGER = 0x0108
+RETURN_ZERO = 0x0402
+FEEDBACK_TORQUE = 0x060C
+MAX_CURRENT = 0x0306
+CURRENT_P = 0x0610
+MOVEOVER = 0x0604
+
+ALARM_STATUS = 0x0612
+PORT = '/dev/grap'  # 确保设备端口正确
+BAUD = 115200
+POSITION_HIGH_8 = 0x0102  # 位置寄存器高八位
+POSITION_LOW_8 = 0x0103  # 位置寄存器低八位
+
+
+# 初始化 Modbus 设备
+instrument = minimalmodbus.Instrument(PORT, 1)
+instrument.serial.baudrate = BAUD
+instrument.serial.bytesize = 8
+instrument.serial.parity = minimalmodbus.serial.PARITY_NONE
+instrument.serial.stopbits = 1
+instrument.serial.timeout = 1
+
+lock = threading.Lock()
+current_position_dataset = []
+current_action_dataset = []
+
+def init(dataset_dir):
+    # 初始文件计数器
+    file_count = 1
+    dir_count = 1
+    filename = f"{dataset_dir}/result_{file_count}.txt"
+    BASE_DIR = f"{dataset_dir}/captured_frames"
+
+    FRAMES_OUTPUT_DIR = f"{BASE_DIR}/result_{dir_count}"  # 输出目录
+
+    # 检查是否存在，如果存在则递增计数器
+    while os.path.exists(FRAMES_OUTPUT_DIR):
+            dir_count += 1
+            FRAMES_OUTPUT_DIR = os.path.join(BASE_DIR, f"result_{dir_count}")
+    else:
+        try:
+            os.makedirs(FRAMES_OUTPUT_DIR)
+        except FileExistsError:
+            print(FRAMES_OUTPUT_DIR)
+
+    while os.path.exists(filename):
+        file_count += 1
+        filename = f"{dataset_dir}/result_{file_count}.txt"
+
+    return FRAMES_OUTPUT_DIR, filename
+
+def enable(instrument):
+    with lock:
+        instrument.write_register(ENABLE, 1, functioncode=6)
+
+# 写入位置
+def write_position(instrument, value):
+    with lock:
+        instrument.write_long(POSITION_HIGH_8, value)
+
+# 写入速度
+def write_speed(instrument, speed):
+    with lock:
+        instrument.write_register(SPEED, speed, functioncode=6)
+
+# 写输入
+def write_force(instrument, force):
+    with lock:
+        instrument.write_register(FORCE, force, functioncode=6)
+
+# 触发运动
+def trigger_motion(instrument):
+    with lock:
+        instrument.write_register(MOTION_TRIGGER, 1, functioncode=6)
+
+def acceleration(instrument,acc):
+    with lock:
+        instrument.write_register(ACCELERATION, acc, functioncode=6)
+
+def deacceleration(instrument,deacc):
+    with lock:
+        instrument.write_register(DEACCELERATION, deacc, functioncode=6)
+
+def read_torque():
+    with lock:
+        try:
+            return instrument.read_register(FEEDBACK_TORQUE)
+        except minimalmodbus.NoResponseError:
+            rospy.logwarn("No response from Modbus device when reading torque")
+            return None
+
+
+def read_max_current():
+    with lock:
+        try:
+            return instrument.read_register(MAX_CURRENT)
+        except minimalmodbus.NoResponseError:
+            rospy.logwarn("No response from Modbus device when reading torque")
+            return None
+
+def read_current():
+    with lock:
+        try:
+            return instrument.read_register(CURRENT_P)
+        except minimalmodbus.NoResponseError:
+            rospy.logwarn("No response from Modbus device when reading torque")
+            return None
+
+
+def read_move_over():
+    with lock:
+        try:
+            return instrument.read_register(MOVEOVER)
+        except minimalmodbus.NoResponseError:
+            rospy.logwarn("No response from Modbus device when reading torque")
+            return None
+
+def read_force():
+    current = read_torque()
+    max_current = read_max_current()
+
+    # print(f"current = {current}, max_current = {max_current}")
+    if max_current is not None and current is not None:
+        force = current / max_current * 25  # Force calculation
+        # print(f"force = {force}")
+    return force
+
+
+def return_to_default(default):
+    rospy.logwarn("Motion successfully--------------------------.")
+    write_speed(instrument, 1)
+    write_force(instrument, 100)
+    write_position(instrument, default)
+    trigger_motion(instrument)   
+
+
+def read_position():
+    try:
+        # 读取 0x0609（高位）和 0x060A（低位）寄存器
+        high = instrument.read_register(0x0609, 0, 3)  # 读取高位寄存器
+        low = instrument.read_register(0x060A, 0, 3)  # 读取低位寄存器
+
+        # 执行器位置 = 高位 << 16 + 低位
+        actuator_position = (high << 16) + low
+
+        # print(f"Actuator Position: {actuator_position}")
+
+        return actuator_position
+
+    except Exception as e:
+        rospy.logwarn(f"Failed to read position: {str(e)}")
+        return None
+
+def return_to_zero():
+    write_speed(instrument, 10)
+    write_force(instrument, 0)
+    write_position(instrument, 0)
+    trigger_motion(instrument)
+
+
+class driver():
+    global FRAMES_OUTPUT_DIR
+    def __init__(self):
+
+        self.parser = argparse.ArgumentParser(description="Pass dataset directory as argument.")
+        self.parser.add_argument('--dir', type=str, default="/home/woosh/catkin_ws/src/demo/scripts/gripper/dataset_position", required=False, help="Path to the dataset directory")
+        self.dataset_dir = self.parser.parse_args().dir
+        self.frames_output_dir, self.filename = init(self.dataset_dir)
+
+    def move_arm_to_position(x, y, z, roll, pitch, yaw, self):
+        # 初始化 MoveIt! 的接口
+        moveit_commander.roscpp_initialize(sys.argv)
+        arm = moveit_commander.MoveGroupCommander("arm")  # Replace with your robot's arm group name
+
+        # 设置机械臂末端目标位姿
+        target_pose = Pose()
+        target_pose.position.x = x
+        target_pose.position.y = y
+        target_pose.position.z = z
+        
+        # 通过欧拉角设置目标姿态
+        from tf.transformations import quaternion_from_euler
+        quaternion = quaternion_from_euler(roll, pitch, yaw)
+        target_pose.orientation.x = quaternion[0]
+        target_pose.orientation.y = quaternion[1]
+        target_pose.orientation.z = quaternion[2]
+        target_pose.orientation.w = quaternion[3]
+        
+        # 设置目标位置
+        arm.set_pose_target(target_pose)
+
+        # Retry mechanism until success
+        max_retries = 5  # Set the maximum number of retries
+        retries = 0
+        success = False
+
+        while not success and retries < max_retries:
+            rospy.loginfo(f"Attempting to move arm to target pose... (Attempt {retries + 1})")
+            success = arm.go(wait=True)
+            
+            if success:
+                rospy.loginfo("Motion executed successfully.")
+
+            else:
+                # rospy.logwarn(f"Motion planning failed on attempt {retries + 1}. Retrying...")
+                retries += 1
+                # Optionally, you can add a sleep time between retries to avoid overwhelming the system
+                rospy.sleep(1)
+        # if count_move_arm == 2:
+        #     #等待机械臂移动到稳定位置
+        #     # time.sleep(3)
+        #     stop_video_recording()  # 调用服务来停止录制
+
+        # Stop the arm and clear the target pose
+        arm.stop()
+        arm.clear_pose_targets()
+
+        global gripper_move_flag
+        if not success:
+            rospy.logwarn(f"Motion planning failed after {max_retries} attempts.")
+            gripper_move_flag = False
+
+        # 关闭 MoveIt! 接口
+        moveit_commander.roscpp_shutdown()
+        
+        def move_arm_second(x, y, z, roll, pitch, yaw):
+            # 初始化 MoveIt! 的接口
+            moveit_commander.roscpp_initialize(sys.argv)
+            arm = moveit_commander.MoveGroupCommander("arm")  # Replace with your robot's arm group name
+
+            # 设置机械臂末端目标位姿
+            target_pose = Pose()
+            target_pose.position.x = x
+            target_pose.position.y = y
+            target_pose.position.z = z
+            
+            # 通过欧拉角设置目标姿态
+            from tf.transformations import quaternion_from_euler
+            quaternion = quaternion_from_euler(roll, pitch, yaw)
+            target_pose.orientation.x = quaternion[0]
+            target_pose.orientation.y = quaternion[1]
+            target_pose.orientation.z = quaternion[2]
+            target_pose.orientation.w = quaternion[3]
+
+            # # 设置目标位置
+            arm.set_pose_target(target_pose)
+
+            # # 规划路径并执行
+            success = arm.go(wait=True)  # wait=True 确保执行完成后返回
+
+            # global count_move_arm
+            # count_move_arm += 1
+            # print(f"count_move_arm = {count_move_arm}")
+
+            # print(f"success = {success}")
+            # 关闭 MoveIt! 接口
+            moveit_commander.roscpp_shutdown()
+
+
+
+    def arm_move(x, y, z, roll, pitch, yaw, self):
+        try:
+            self.move_arm_to_position(x, y, z, roll, pitch, yaw) 
+            # move_arm_to_position(x=-0.3, y=-0.4, z=0.3, roll=3.0289023714231504, pitch=-0.03886905548139934, yaw=-1.560858825876455)
+        except rospy.ROSInterruptException:
+            pass
+
+
+    # 读取键盘输入
+    def get_key(self):
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            ch = sys.stdin.read(1)
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        return ch
+
+
+    def key_listener(self):
+        print("pls input")
+        rate = rospy.Rate(25)  # 10Hz
+        while not self.is_recording_over:
+            key = self.get_key()  # 获取键盘输入
+            # print("pls input")
+            # get_force()
+            if key == 'q':
+                self.is_recording_over = True
+                rospy.loginfo("Quitting...")
+                print(f"is_recording_over = {self.is_recording_over}")
+                break
+            rate.sleep()
+
+
+    def save_data(self):
+        global current_position_dataset, current_action_dataset
+
+        data_dict = {
+            'current_position': current_position_dataset,
+            'next_action': current_action_dataset
+        }
+
+        # 使用 json.dump() 将数据写入文件
+        with open(self.filename, "w") as f:
+            json.dump(data_dict, f, indent=4)  # indent=4 会格式化 JSON，使其更易读
+        print(f"{self.filename} save successfully!")
+
+
+
+    def main(self):
+
+        global current_position_dataset, current_action_dataset
+        rospy.init_node('gelsightmini_control', anonymous=True)
+
+        # move arm first
+        #self.arm_move(x=-0.014, y=-0.465, z=0.197, roll=radians(-179.073), pitch=radians(0.977), yaw=radians(0.217))
+
+        # download the gripper
+        enable(instrument)
+        return_to_zero()
+
+        """按频率捕获图像"""
+        self.cap = cv2.VideoCapture(0)
+        
+        frame_count = 0
+        start_time = time.time()
+        last_capture = start_time
+        interval = 0.5
+
+        # 保存图像
+        window_name = 'gelsight sensor image'
+        cv2.namedWindow(window_name, cv2.WND_PROP_FULLSCREEN)
+        cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
+
+        try:
+            # demonstration
+            while not rospy.is_shutdown():
+
+                current_time = time.time()
+                
+                # # 检查是否达到运行时长
+                # if (current_time - start_time) >= 10:
+                #     break
+                    
+                # 读取帧
+                self.ret, self.frame = self.cap.read()
+                if not self.ret:
+                    print("无法读取摄像头帧！")
+                    break
+                    
+                # 获取帧尺寸
+                h, w = self.frame.shape[:2]
+
+                # 缩放比例（不超过屏幕）
+                scale = min(screen_width / w, screen_height / h)
+                new_w, new_h = int(w * scale), int(h * scale)
+                self.resized_frame = cv2.resize(self.frame, (new_w, new_h))
+
+
+                # 按频率捕获
+                if (current_time - last_capture) >= interval:
+                    last_capture = current_time
+                    frame_count += 1
+                    
+                    # 生成文件名（带时间戳）
+                    # timestamp = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+                    frame_filename = f"frame_{frame_count}.jpg"
+                    filepath = os.path.join(self.frames_output_dir, frame_filename)
+                    
+                    current_position_data = read_position()
+                    # time.sleep(0.2)
+                    if len(current_position_dataset) >= 1:
+                        current_action_data = current_position_data - before_position_data
+                    # print(current_position_data)
+                        current_action_dataset.append(current_action_data)
+
+                    current_position_dataset.append(current_position_data)
+                    before_position_data = current_position_data
+
+                    cv2.imwrite(filepath, self.frame)
+                    # print(f"已保存: in {filepath}/{frame_filename}")
+                    
+                # 实时预览（可选）
+                cv2.imshow(window_name, self.resized_frame)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+
+            # add the lastest action
+            current_action_dataset.append(current_action_data)
+            self.save_data()
+
+        finally:
+            self.cap.release()
+            cv2.destroyAllWindows()
+            print(f"捕获完成！共保存 {frame_count} 张图像, {len(current_action_dataset)} 份数据")
+    
+if __name__ == '__main__':
+    driver = driver()
+    driver.main()
+
+
+
+
+
+
+
+
